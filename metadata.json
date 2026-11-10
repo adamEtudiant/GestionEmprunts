@@ -1,0 +1,8 @@
+{
+  "name": "BiblioEmprunts",
+  "description": "Système de gestion des emprunts de bibliothèque avec scan QR code, vérification de disponibilité, suivi des retards, relance par email et recherche multicritère.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

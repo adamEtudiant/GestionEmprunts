@@ -1,0 +1,405 @@
+package com.example.viewmodel
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.data.local.AppDatabase
+import com.example.data.local.BookEntity
+import com.example.data.local.EmailNotificationLogEntity
+import com.example.data.local.LoanEntity
+import com.example.data.local.StudentEntity
+import com.example.data.repository.AvailabilityCheckResult
+import com.example.data.repository.LibraryRepository
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+
+enum class AppRole {
+    GERANT,
+    UTILISATEUR
+}
+
+data class AuthenticatedUser(
+    val email: String,
+    val role: AppRole,
+    val displayName: String,
+    val studentProfile: StudentEntity? = null
+)
+
+sealed class AuthState {
+    object Loading : AuthState()
+    object LoggedOut : AuthState()
+    data class Authenticated(val user: AuthenticatedUser) : AuthState()
+    data class Error(val message: String) : AuthState()
+}
+
+enum class LoanFilter {
+    ALL,
+    ACTIVE,
+    OVERDUE,
+    RETURNED
+}
+
+data class LoanRegistrationState(
+    val student: StudentEntity? = null,
+    val book: BookEntity? = null,
+    val availability: AvailabilityCheckResult? = null,
+    val isRegistering: Boolean = false,
+    val successMessage: String? = null,
+    val errorMessage: String? = null
+)
+
+class LibraryViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val repository: LibraryRepository
+
+    init {
+        val database = AppDatabase.getDatabase(application, viewModelScope)
+        repository = LibraryRepository(database.libraryDao())
+        restoreSavedSession()
+    }
+
+    // -------------------------------------------------------------
+    // AUTHENTICATION & SESSION STATE
+    // -------------------------------------------------------------
+    private val _authState = MutableStateFlow<AuthState>(AuthState.Loading)
+    val authState: StateFlow<AuthState> = _authState.asStateFlow()
+
+    private val _currentRole = MutableStateFlow(AppRole.GERANT)
+    val currentRole: StateFlow<AppRole> = _currentRole.asStateFlow()
+
+    private val _loggedInUser = MutableStateFlow<AuthenticatedUser?>(null)
+    val loggedInUser: StateFlow<AuthenticatedUser?> = _loggedInUser.asStateFlow()
+
+    private fun restoreSavedSession() {
+        viewModelScope.launch {
+            val savedEmail = repository.getSavedSessionEmail()
+            if (!savedEmail.isNullOrBlank()) {
+                val user = resolveUserByEmail(savedEmail)
+                if (user != null) {
+                    _loggedInUser.value = user
+                    _currentRole.value = user.role
+                    _authState.value = AuthState.Authenticated(user)
+                    return@launch
+                }
+            }
+            _authState.value = AuthState.LoggedOut
+        }
+    }
+
+    private suspend fun resolveUserByEmail(email: String): AuthenticatedUser? {
+        val cleaned = email.trim().lowercase()
+        // Special Manager Account (and aliases like gerant@, admin@, bibliotheque@)
+        if (cleaned == "gerant@usmba.ac.ma" || cleaned == "admin@usmba.ac.ma" || cleaned == "bibliotheque@usmba.ac.ma"
+            || cleaned.startsWith("gerant@") || cleaned.startsWith("admin@")) {
+            return AuthenticatedUser(
+                email = email.trim(),
+                role = AppRole.GERANT,
+                displayName = "Gérant de Bibliothèque USMBA"
+            )
+        }
+
+        // Student Account lookup in database
+        val student = repository.getStudentByEmail(cleaned)
+        if (student != null) {
+            return AuthenticatedUser(
+                email = student.email,
+                role = AppRole.UTILISATEUR,
+                displayName = student.fullName,
+                studentProfile = student
+            )
+        }
+
+        // If email belongs to @usmba.ac.ma domain, auto-create student session
+        if (cleaned.endsWith("@usmba.ac.ma")) {
+            val prefix = cleaned.substringBefore("@usmba.ac.ma")
+            val nameParts = prefix.split(".", "_", "-")
+            val derivedName = nameParts.joinToString(" ") { part ->
+                part.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+            }
+            val dynamicStudent = StudentEntity(
+                studentCardQr = "STUDENT-USMBA-${System.currentTimeMillis() % 100000}",
+                studentNumber = "USMBA-${(1000..9999).random()}",
+                fullName = if (derivedName.isNotBlank()) derivedName else "Étudiant USMBA",
+                email = cleaned,
+                department = "Université Sidi Mohamed Ben Abdellah",
+                phone = "06 00 00 00 00"
+            )
+            return AuthenticatedUser(
+                email = cleaned,
+                role = AppRole.UTILISATEUR,
+                displayName = dynamicStudent.fullName,
+                studentProfile = dynamicStudent
+            )
+        }
+
+        return null
+    }
+
+    fun loginWithGoogleAcademic(accountEmail: String) {
+        val trimmed = accountEmail.trim().lowercase()
+        if (!trimmed.endsWith("@usmba.ac.ma")) {
+            _authState.value = AuthState.Error(
+                "Accès restreint : Veuillez choisir votre compte institutionnel Google (@usmba.ac.ma)."
+            )
+            return
+        }
+
+        loginWithEmail(trimmed)
+    }
+
+    fun loginWithEmail(email: String) {
+        val trimmed = email.trim()
+        if (trimmed.isBlank()) {
+            _authState.value = AuthState.Error("Veuillez saisir votre adresse email académique USMBA.")
+            return
+        }
+
+        if (!trimmed.contains("@")) {
+            _authState.value = AuthState.Error("Format d'adresse email invalide.")
+            return
+        }
+
+        if (!trimmed.lowercase().endsWith("@usmba.ac.ma")) {
+            _authState.value = AuthState.Error(
+                "Le domaine doit être @usmba.ac.ma (Université Sidi Mohamed Ben Abdellah)."
+            )
+            return
+        }
+
+        viewModelScope.launch {
+            val user = resolveUserByEmail(trimmed)
+            if (user != null) {
+                repository.saveSessionEmail(user.email)
+                _loggedInUser.value = user
+                _currentRole.value = user.role
+                _authState.value = AuthState.Authenticated(user)
+            } else {
+                _authState.value = AuthState.Error(
+                    "Aucun compte académique trouvé pour '$trimmed'."
+                )
+            }
+        }
+    }
+
+    fun logout() {
+        viewModelScope.launch {
+            repository.clearSessionEmail()
+            _loggedInUser.value = null
+            _authState.value = AuthState.LoggedOut
+        }
+    }
+
+    fun switchRole(role: AppRole) {
+        _currentRole.value = role
+    }
+
+    // Data streams
+    val allStudents: StateFlow<List<StudentEntity>> = repository.allStudents
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val allBooks: StateFlow<List<BookEntity>> = repository.allBooks
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val emailLogs: StateFlow<List<EmailNotificationLogEntity>> = repository.emailLogs
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val categories: StateFlow<List<String>> = repository.categories
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // -------------------------------------------------------------
+    // USE CASE 1: Enregistrer un emprunt (via QR Code)
+    // -------------------------------------------------------------
+    private val _registrationState = MutableStateFlow(LoanRegistrationState())
+    val registrationState: StateFlow<LoanRegistrationState> = _registrationState.asStateFlow()
+
+    fun onScanStudentCard(scannedCode: String) {
+        viewModelScope.launch {
+            val student = repository.getStudentByCardQr(scannedCode)
+            if (student != null) {
+                _registrationState.value = _registrationState.value.copy(
+                    student = student,
+                    errorMessage = null
+                )
+            } else {
+                _registrationState.value = _registrationState.value.copy(
+                    errorMessage = "Carte étudiante non reconnue : '$scannedCode'"
+                )
+            }
+        }
+    }
+
+    fun onScanBookQr(scannedCode: String) {
+        viewModelScope.launch {
+            val book = repository.getBookByQrCode(scannedCode)
+            if (book != null) {
+                val availability = repository.checkBookAvailabilityById(book.id)
+                _registrationState.value = _registrationState.value.copy(
+                    book = book,
+                    availability = availability,
+                    errorMessage = null
+                )
+            } else {
+                _registrationState.value = _registrationState.value.copy(
+                    errorMessage = "Ouvrage non reconnu pour le QR code : '$scannedCode'"
+                )
+            }
+        }
+    }
+
+    fun confirmLoanRegistration(loanDurationDays: Int = 14) {
+        val current = _registrationState.value
+        val student = current.student
+        val book = current.book
+
+        if (student == null) {
+            _registrationState.value = current.copy(errorMessage = "Veuillez scanner la carte d'étudiant.")
+            return
+        }
+        if (book == null) {
+            _registrationState.value = current.copy(errorMessage = "Veuillez scanner le QR Code de l'ouvrage.")
+            return
+        }
+        if (current.availability !is AvailabilityCheckResult.Available) {
+            _registrationState.value = current.copy(errorMessage = "L'ouvrage n'est pas disponible pour l'emprunt.")
+            return
+        }
+
+        viewModelScope.launch {
+            _registrationState.value = current.copy(isRegistering = true)
+            val result = repository.registerLoan(student, book, loanDurationDays)
+            if (result.isSuccess) {
+                _registrationState.value = LoanRegistrationState(
+                    successMessage = "Emprunt validé avec succès pour '${book.title}' par ${student.fullName} !"
+                )
+            } else {
+                _registrationState.value = current.copy(
+                    isRegistering = false,
+                    errorMessage = result.exceptionOrNull()?.message ?: "Erreur lors de l'enregistrement."
+                )
+            }
+        }
+    }
+
+    fun resetRegistration() {
+        _registrationState.value = LoanRegistrationState()
+    }
+
+    // -------------------------------------------------------------
+    // USE CASE 2: Suivre les emprunts et les retards
+    // -------------------------------------------------------------
+    private val _loanFilter = MutableStateFlow(LoanFilter.ALL)
+    val loanFilter: StateFlow<LoanFilter> = _loanFilter.asStateFlow()
+
+    fun setLoanFilter(filter: LoanFilter) {
+        _loanFilter.value = filter
+    }
+
+    val allLoans: StateFlow<List<LoanEntity>> = repository.allLoans
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val filteredLoans: StateFlow<List<LoanEntity>> = combine(
+        repository.allLoans,
+        _loanFilter
+    ) { loans, filter ->
+        val now = System.currentTimeMillis()
+        when (filter) {
+            LoanFilter.ALL -> loans
+            LoanFilter.ACTIVE -> loans.filter { !it.isReturned }
+            LoanFilter.OVERDUE -> loans.filter { !it.isReturned && it.dueDate < now }
+            LoanFilter.RETURNED -> loans.filter { it.isReturned }
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val overdueLoansCount: StateFlow<Int> = repository.allLoans.combine(MutableStateFlow(Unit)) { loans, _ ->
+        val now = System.currentTimeMillis()
+        loans.count { !it.isReturned && it.dueDate < now }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+
+    fun markLoanAsReturned(loanId: Long) {
+        viewModelScope.launch {
+            repository.returnLoan(loanId)
+        }
+    }
+
+    // Email dispatch via Service Email
+    private val _selectedLoanForEmail = MutableStateFlow<LoanEntity?>(null)
+    val selectedLoanForEmail: StateFlow<LoanEntity?> = _selectedLoanForEmail.asStateFlow()
+
+    fun openEmailReminderDialog(loan: LoanEntity) {
+        _selectedLoanForEmail.value = loan
+    }
+
+    fun closeEmailReminderDialog() {
+        _selectedLoanForEmail.value = null
+    }
+
+    fun dispatchEmailReminder(subject: String, body: String) {
+        val loan = _selectedLoanForEmail.value ?: return
+        viewModelScope.launch {
+            repository.sendEmailReminder(loan, subject, body)
+        }
+    }
+
+    fun triggerBulkOverdueReminders() {
+        viewModelScope.launch {
+            val now = System.currentTimeMillis()
+            val overdue = allLoans.value.filter { !it.isReturned && it.dueDate < now }
+            repository.sendBulkEmailReminders(overdue)
+        }
+    }
+
+    // -------------------------------------------------------------
+    // USE CASE 3: Rechercher un ouvrage (Multicritère) [Utilisateur]
+    // -------------------------------------------------------------
+    val searchQuery = MutableStateFlow("")
+    val selectedCategory = MutableStateFlow("Tous")
+    val selectedAvailability = MutableStateFlow("Tous")
+    val selectedSortBy = MutableStateFlow("title")
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val searchResults: StateFlow<List<BookEntity>> = combine(
+        searchQuery,
+        selectedCategory,
+        selectedAvailability,
+        selectedSortBy
+    ) { query, category, availability, sortBy ->
+        SearchCriteria(query, category, availability, sortBy)
+    }.flatMapLatest { criteria ->
+        repository.searchBooks(
+            query = criteria.query,
+            category = criteria.category,
+            availability = criteria.availability,
+            sortBy = criteria.sortBy
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    fun updateSearchQuery(query: String) {
+        searchQuery.value = query
+    }
+
+    fun updateSelectedCategory(category: String) {
+        selectedCategory.value = category
+    }
+
+    fun updateSelectedAvailability(availability: String) {
+        selectedAvailability.value = availability
+    }
+
+    fun updateSelectedSortBy(sortBy: String) {
+        selectedSortBy.value = sortBy
+    }
+
+    private data class SearchCriteria(
+        val query: String,
+        val category: String,
+        val availability: String,
+        val sortBy: String
+    )
+}
